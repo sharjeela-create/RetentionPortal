@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/router";
 
 import { supabase } from "@/lib/supabase";
@@ -9,15 +9,6 @@ import {
   type DuplicateLeadFinderResult,
 } from "@/lib/duplicate-leads";
 import type { MondayComDeal } from "@/types";
-
- type RetentionType = "new_sale" | "fixed_payment" | "carrier_requirements";
-
-type RetentionModalStep = "select" | "carrier_alert" | "banking_form";
-
- type RetentionAgentOption = {
-   profile_id: string;
-   display_name: string;
- };
 
 export type LeadRecord = Record<string, unknown>;
 
@@ -61,36 +52,6 @@ export function buildDigitWildcardPattern(digits: string) {
      parts.pop();
    }
    return parts.join(" ");
- }
-
- function buildLeadVendorOrFilter(leadVendorRaw: string) {
-   const raw = leadVendorRaw.trim();
-   if (!raw.length) return null;
-
-   // Remove LIKE wildcards to avoid accidental broad matches.
-   const cleanedRaw = raw.replace(/[%_]/g, " ").replace(/\s+/g, " ").trim();
-   const normalizedCore = normalizeVendorForMatch(cleanedRaw);
-   const coreTitle = normalizedCore
-     .split(" ")
-     .map((p) => (p.length ? p[0]!.toUpperCase() + p.slice(1) : p))
-     .join(" ");
-
-   const patterns = Array.from(
-     new Set(
-       [
-         cleanedRaw,
-         cleanedRaw.toLowerCase(),
-         normalizedCore,
-         coreTitle,
-         `${normalizedCore} %`,
-         `${coreTitle} %`,
-       ]
-         .map((p) => p.trim())
-         .filter((p) => p.length)
-     )
-   );
-
-   return patterns.map((p) => `lead_vendor.ilike.${p}`).join(",");
  }
 
 export function getString(row: LeadRecord | null, key: string): string | null {
@@ -161,6 +122,71 @@ export function pickRowValue(row: Record<string, unknown>, keys: string[]): unkn
   return null;
 }
 
+function mergeLeadRecords(
+  allLeads: LeadRecord[],
+  preferredVendor: string | null,
+): LeadRecord | null {
+  if (!allLeads.length) return null;
+
+  const normalizedPreferred = preferredVendor
+    ? normalizeVendorForMatch(preferredVendor.trim())
+    : null;
+
+  let exactMatch: LeadRecord | null = null;
+  const otherLeads: LeadRecord[] = [];
+
+  for (const lead of allLeads) {
+    const vendor = getString(lead, "lead_vendor");
+    if (vendor && normalizedPreferred) {
+      const normalized = normalizeVendorForMatch(vendor);
+      if (normalized === normalizedPreferred) {
+        if (!exactMatch) exactMatch = lead;
+        continue;
+      }
+    }
+    otherLeads.push(lead);
+  }
+
+  const primary = exactMatch ?? allLeads[0];
+  if (!primary) return null;
+
+  const fallbackSources = exactMatch ? otherLeads : allLeads.slice(1);
+
+  const merged: LeadRecord = { ...primary };
+
+  const fieldsToMerge = [
+    "email",
+    "street_address",
+    "city",
+    "state",
+    "zip_code",
+    "date_of_birth",
+    "social_security",
+    "carrier",
+    "product_type",
+    "policy_number",
+    "monthly_premium",
+    "agent",
+    "phone_number",
+    "customer_full_name",
+  ];
+
+  for (const field of fieldsToMerge) {
+    const primaryValue = getString(merged, field);
+    if (!primaryValue || primaryValue === "-") {
+      for (const fallback of fallbackSources) {
+        const fallbackValue = getString(fallback, field);
+        if (fallbackValue && fallbackValue !== "-") {
+          merged[field] = fallbackValue;
+          break;
+        }
+      }
+    }
+  }
+
+  return merged;
+}
+
 export function formatCurrency(value: unknown): string {
   if (value === null || value === undefined) return "—";
   if (typeof value === "number") {
@@ -183,8 +209,14 @@ export function useAssignedLeadDetails() {
   const idParam = router.query.id;
   const dealIdParam = router.query.dealId;
 
+  const rawDealId =
+    typeof dealIdParam === "string" ? dealIdParam : Array.isArray(dealIdParam) ? dealIdParam[0] : undefined;
+  const parsedDealId = rawDealId ? Number(rawDealId) : null;
+  const dealId = parsedDealId != null && Number.isFinite(parsedDealId) ? parsedDealId : null;
+
   const [lead, setLead] = useState<LeadRecord | null>(null);
   const [personalLead, setPersonalLead] = useState<LeadRecord | null>(null);
+  const [allPersonalLeads, setAllPersonalLeads] = useState<LeadRecord[]>([]);
   const [personalLeadLoading, setPersonalLeadLoading] = useState(false);
   const [selectedDeal, setSelectedDeal] = useState<MondayComDeal | null>(null);
   const [mondayDeals, setMondayDeals] = useState<MondayComDeal[]>([]);
@@ -206,118 +238,12 @@ export function useAssignedLeadDetails() {
   const [verificationError, setVerificationError] = useState<string | null>(null);
   const [verificationInputValues, setVerificationInputValues] = useState<Record<string, string>>({});
 
-  const [retentionModalOpen, setRetentionModalOpen] = useState(false);
-  const [retentionAgent, setRetentionAgent] = useState<string>("");
-  const [retentionType, setRetentionType] = useState<RetentionType | "">("");
-  const [retentionAgentLocked, setRetentionAgentLocked] = useState(false);
-  const [retentionAgentOptions, setRetentionAgentOptions] = useState<RetentionAgentOption[]>([]);
+  const [assignedDealIds, setAssignedDealIds] = useState<number[]>([]);
+  const [assignedDealsLoading, setAssignedDealsLoading] = useState(false);
 
-  const [retentionStep, setRetentionStep] = useState<RetentionModalStep>("select");
-  const [bankingPolicyStatus, setBankingPolicyStatus] = useState<"issued" | "pending">("issued");
-  const [bankingAccountHolderName, setBankingAccountHolderName] = useState("");
-  const [bankingBankName, setBankingBankName] = useState("");
-  const [bankingRoutingNumber, setBankingRoutingNumber] = useState("");
-  const [bankingAccountNumber, setBankingAccountNumber] = useState("");
-  const [bankingAccountType, setBankingAccountType] = useState<"Checking" | "Savings" | "">("");
-  const [bankingDraftDate, setBankingDraftDate] = useState("");
-  const [bankingSaving, setBankingSaving] = useState(false);
-  const [bankingSaveError, setBankingSaveError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    const loadLoggedInAgent = async () => {
-      try {
-        const {
-          data: { session },
-          error: sessionError,
-        } = await supabase.auth.getSession();
-
-        if (sessionError) throw sessionError;
-        if (!session?.user) return;
-
-        const { data: profile, error: profileError } = await supabase
-          .from("profiles")
-          .select("display_name")
-          .eq("user_id", session.user.id)
-          .maybeSingle();
-
-        if (profileError) throw profileError;
-
-        const name = (profile?.display_name as string | null) ?? null;
-        if (!cancelled && name && name.trim().length) {
-          setRetentionAgent(name);
-          setRetentionAgentLocked(true);
-        }
-      } catch {
-        if (!cancelled) setRetentionAgentLocked(false);
-      }
-    };
-
-    void loadLoggedInAgent();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const loadRetentionAgents = async () => {
-      try {
-        const { data: raRows, error: raError } = await supabase
-          .from("retention_agents")
-          .select("profile_id")
-          .eq("active", true);
-
-        if (raError) throw raError;
-
-        const profileIds = (raRows ?? [])
-          .map((row) => (row?.profile_id as string | null) ?? null)
-          .filter((v): v is string => !!v && v.length > 0);
-
-        if (profileIds.length === 0) {
-          if (!cancelled) setRetentionAgentOptions([]);
-          return;
-        }
-
-        const { data: profileRows, error: profilesError } = await supabase
-          .from("profiles")
-          .select("id, display_name")
-          .in("id", profileIds);
-
-        if (profilesError) throw profilesError;
-
-        const mapped: RetentionAgentOption[] = (profileRows ?? [])
-          .map((p) => {
-            const id = (p?.id as string | null) ?? null;
-            const name = (p?.display_name as string | null) ?? null;
-            if (!id || !name || !name.trim().length) return null;
-            return { profile_id: id, display_name: name };
-          })
-          .filter((v): v is RetentionAgentOption => !!v);
-
-        mapped.sort((a, b) => a.display_name.localeCompare(b.display_name));
-
-        if (!cancelled) setRetentionAgentOptions(mapped);
-      } catch (e) {
-        console.error("[assigned-lead-details] load retention agents error", e);
-        if (!cancelled) setRetentionAgentOptions([]);
-      }
-    };
-
-    void loadRetentionAgents();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   useEffect(() => {
     if (!router.isReady) return;
-
-    const rawDealId =
-      typeof dealIdParam === "string" ? dealIdParam : Array.isArray(dealIdParam) ? dealIdParam[0] : undefined;
-    const parsedDealId = rawDealId ? Number(rawDealId) : null;
-    const dealId = parsedDealId != null && Number.isFinite(parsedDealId) ? parsedDealId : null;
 
     const id = typeof idParam === "string" ? idParam : Array.isArray(idParam) ? idParam[0] : undefined;
     const leadId = id && id.trim().length ? id : null;
@@ -443,11 +369,103 @@ export function useAssignedLeadDetails() {
     return () => {
       cancelled = true;
     };
-  }, [router.isReady, dealIdParam, idParam]);
+  }, [router.isReady, dealIdParam, idParam, dealId]);
+
+  useEffect(() => {
+    if (!router.isReady) return;
+    if (!dealId) {
+      setAssignedDealIds([]);
+      setAssignedDealsLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+
+    const loadAssignedDealsForAgent = async () => {
+      setAssignedDealsLoading(true);
+      try {
+        const {
+          data: { session },
+          error: sessionError,
+        } = await supabase.auth.getSession();
+
+        if (sessionError) throw sessionError;
+        if (!session?.user) {
+          if (!cancelled) setAssignedDealIds([]);
+          return;
+        }
+
+        const { data: profile, error: profileError } = await supabase
+          .from("profiles")
+          .select("id")
+          .eq("user_id", session.user.id)
+          .maybeSingle();
+
+        if (profileError) throw profileError;
+        const profileId = (profile?.id as string | null) ?? null;
+        if (!profileId) {
+          if (!cancelled) setAssignedDealIds([]);
+          return;
+        }
+
+        const { data: rows, error: assignedError } = await supabase
+          .from("retention_assigned_leads")
+          .select("deal_id, assigned_at")
+          .eq("assignee_profile_id", profileId)
+          .eq("status", "active")
+          .order("assigned_at", { ascending: false })
+          .limit(5000);
+
+        if (assignedError) throw assignedError;
+
+        const ids = (rows ?? [])
+          .map((r) => (typeof r?.deal_id === "number" ? (r.deal_id as number) : null))
+          .filter((v): v is number => v != null);
+
+        if (!cancelled) setAssignedDealIds(ids);
+      } catch (e) {
+        console.error("[assigned-lead-details] load assigned deal ids error", e);
+        if (!cancelled) setAssignedDealIds([]);
+      } finally {
+        if (!cancelled) setAssignedDealsLoading(false);
+      }
+    };
+
+    void loadAssignedDealsForAgent();
+    return () => {
+      cancelled = true;
+    };
+  }, [router.isReady, dealId]);
+
+  const currentAssignedIndex = useMemo(() => {
+    if (!dealId) return -1;
+    return assignedDealIds.indexOf(dealId);
+  }, [assignedDealIds, dealId]);
+
+  const previousAssignedDealId = useMemo(() => {
+    if (currentAssignedIndex < 0) return null;
+    return assignedDealIds[currentAssignedIndex - 1] ?? null;
+  }, [assignedDealIds, currentAssignedIndex]);
+
+  const nextAssignedDealId = useMemo(() => {
+    if (currentAssignedIndex < 0) return null;
+    return assignedDealIds[currentAssignedIndex + 1] ?? null;
+  }, [assignedDealIds, currentAssignedIndex]);
+
+  const goToPreviousAssignedLead = async () => {
+    if (!previousAssignedDealId) return;
+    await router.push(`/agent/assigned-lead-details?dealId=${encodeURIComponent(String(previousAssignedDealId))}`);
+  };
+
+  const goToNextAssignedLead = async () => {
+    if (!nextAssignedDealId) return;
+    await router.push(`/agent/assigned-lead-details?dealId=${encodeURIComponent(String(nextAssignedDealId))}`);
+  };
 
   useEffect(() => {
     if (selectedDeal) {
       setPersonalLead(null);
+      setAllPersonalLeads([]);
       setPersonalLeadLoading(false);
       setDuplicateResult(null);
       setDuplicateError(null);
@@ -457,6 +475,7 @@ export function useAssignedLeadDetails() {
 
     if (!lead) {
       setPersonalLead(null);
+      setAllPersonalLeads([]);
       setPersonalLeadLoading(false);
       setMondayDeals([]);
       setMondayError(null);
@@ -581,35 +600,33 @@ export function useAssignedLeadDetails() {
     const run = async () => {
       setPersonalLeadLoading(true);
       try {
-        // 1) Preferred: search leads by customer_full_name (GHL name)
         const escaped = lookupName.replace(/,/g, "").trim();
         if (!escaped.length) {
-          if (!cancelled) setPersonalLead(null);
+          if (!cancelled) {
+            setPersonalLead(null);
+            setAllPersonalLeads([]);
+          }
           return;
         }
 
-        let q = supabase
+        const q = supabase
           .from("leads")
           .select("*")
           .ilike("customer_full_name", `%${escaped}%`)
           .order("updated_at", { ascending: false })
           .order("submission_date", { ascending: false })
-          .limit(25);
-
-        if (leadVendor && leadVendor.trim().length) {
-          const vendorOr = buildLeadVendorOrFilter(leadVendor);
-          if (vendorOr) {
-            q = q.or(vendorOr);
-          }
-        }
+          .limit(50);
 
         const { data: byNameRows, error: byNameErr } = await q;
         if (byNameErr) throw byNameErr;
 
-        const byName = (byNameRows ?? []) as LeadRecord[];
-        const chosenByName = byName.length ? (byName[0] as LeadRecord) : null;
+        const allLeads = (byNameRows ?? []) as LeadRecord[];
+        const mergedLead = mergeLeadRecords(allLeads, leadVendor);
 
-        if (!cancelled) setPersonalLead(chosenByName);
+        if (!cancelled) {
+          setAllPersonalLeads(allLeads);
+          setPersonalLead(mergedLead);
+        }
       } finally {
         if (!cancelled) setPersonalLeadLoading(false);
       }
@@ -846,16 +863,40 @@ export function useAssignedLeadDetails() {
     return unique;
   }, [duplicateResult, mondayDeals]);
 
+  const setSelectedPolicyKeyAndSyncUrlWithDealId = useCallback(
+    async (nextKey: string | null) => {
+      setSelectedPolicyKey(nextKey);
+
+      if (!router.isReady || !nextKey) return;
+
+      const match = (policyCards ?? []).find((d) => {
+        const key =
+          (d.monday_item_id && d.monday_item_id.trim().length ? `item:${d.monday_item_id.trim()}` : null) ??
+          `id:${String(d.id)}`;
+        return key === nextKey;
+      });
+
+      const nextDealId = match && typeof match.id === "number" && Number.isFinite(match.id) ? match.id : null;
+      if (!nextDealId) return;
+      if (dealId === nextDealId) return;
+
+      const query = { ...router.query, dealId: String(nextDealId) };
+      await router.replace({ pathname: router.pathname, query }, undefined, { shallow: true });
+    },
+    [dealId, policyCards, router],
+  );
+
   useEffect(() => {
     if (selectedPolicyKey) return;
     if (!policyCards || policyCards.length === 0) return;
 
-    const first = policyCards[0];
+    const fromUrl = dealId ? policyCards.find((d) => d.id === dealId) : null;
+    const chosen = fromUrl ?? policyCards[0];
     const key =
-      (first.monday_item_id && first.monday_item_id.trim().length ? `item:${first.monday_item_id.trim()}` : null) ??
-      `id:${String(first.id)}`;
+      (chosen.monday_item_id && chosen.monday_item_id.trim().length ? `item:${chosen.monday_item_id.trim()}` : null) ??
+      `id:${String(chosen.id)}`;
     setSelectedPolicyKey(key);
-  }, [policyCards, selectedPolicyKey]);
+  }, [dealId, policyCards, selectedPolicyKey]);
 
   const policyViews = useMemo(() => {
     const ddfRows = (dailyFlowRows ?? []) as Array<Record<string, unknown>>;
@@ -1115,6 +1156,7 @@ export function useAssignedLeadDetails() {
 
         const policyKeyForSession = policyNumber ?? fallbackPolicyKey;
 
+        const autofillData = verificationAutofillByFieldName;
         const resp = await fetch("/api/verification-items", {
           method: "POST",
           headers: {
@@ -1126,7 +1168,7 @@ export function useAssignedLeadDetails() {
             dealId: dealIdForVerification,
             policyKey: policyKeyForSession,
             callCenter: selectedPolicyView?.callCenter ?? null,
-            autofill: verificationAutofillByFieldName,
+            autofill: autofillData,
           }),
         });
 
@@ -1144,6 +1186,7 @@ export function useAssignedLeadDetails() {
         const items = (json as { ok: true; items: Array<Record<string, unknown>> }).items;
 
         if (cancelled) return;
+        
         setVerificationSessionId(sessionId);
         const rows = (items ?? []) as Array<Record<string, unknown>>;
         setVerificationItems(rows);
@@ -1184,117 +1227,28 @@ export function useAssignedLeadDetails() {
   }, [lead, personalLead, selectedDeal, selectedPolicyKey, selectedPolicyView, verificationAutofillByFieldName]);
 
   const toggleVerificationItem = async (itemId: string, checked: boolean) => {
+    const currentValue = verificationInputValues[itemId] ?? "";
+    const item = verificationItems.find((r) => r["id"] === itemId) ?? null;
+    const original = item && typeof item["original_value"] === "string" ? (item["original_value"] as string) : "";
+    const isModified = original !== currentValue;
+
     setVerificationItems((prev) =>
-      prev.map((r) => (r["id"] === itemId ? { ...r, is_verified: checked, verified_at: checked ? new Date().toISOString() : null } : r)),
+      prev.map((r) => (r["id"] === itemId ? { ...r, is_verified: checked, verified_at: checked ? new Date().toISOString() : null, verified_value: currentValue, is_modified: isModified } : r)),
     );
 
     const { error: updateErr } = await supabase
       .from("retention_verification_items")
-      .update({ is_verified: checked, verified_at: checked ? new Date().toISOString() : null })
+      .update({ 
+        is_verified: checked, 
+        verified_at: checked ? new Date().toISOString() : null,
+        verified_value: currentValue,
+        is_modified: isModified
+      })
       .eq("id", itemId);
 
     if (updateErr) throw updateErr;
   };
 
-  const openRetentionWorkflowModal = () => {
-    setRetentionStep("select");
-    setBankingSaveError(null);
-    setRetentionModalOpen(true);
-  };
-
-  const startRetentionWorkflow = async () => {
-    const leadId = typeof lead?.["id"] === "string" ? (lead["id"] as string) : null;
-    if (!leadId) return;
-
-    if (!retentionAgent || !retentionType) return;
-
-    if (retentionType === "carrier_requirements") {
-      setRetentionStep("carrier_alert");
-      return;
-    }
-
-    if (retentionType === "fixed_payment") {
-      setRetentionStep("banking_form");
-      return;
-    }
-
-    // For now, route directly to call update for other retention types.
-    const policyNumberForRoute = selectedPolicyView?.policyNumber ?? null;
-    if (!policyNumberForRoute) return;
-    setRetentionModalOpen(false);
-    await router.push(
-      `/agent/call-update?leadId=${encodeURIComponent(leadId)}&policyNumber=${encodeURIComponent(
-        policyNumberForRoute,
-      )}&retentionAgent=${encodeURIComponent(retentionAgent)}&retentionType=${encodeURIComponent(retentionType)}`,
-    );
-  };
-
-  const goToCallUpdate = async () => {
-    const leadId = typeof lead?.["id"] === "string" ? (lead["id"] as string) : null;
-    if (!leadId) return;
-
-    const policyNumberForRoute = selectedPolicyView?.policyNumber ?? null;
-    if (!policyNumberForRoute) return;
-
-    if (!retentionAgent || !retentionType) return;
-
-    setRetentionModalOpen(false);
-    await router.push(
-      `/agent/call-update?leadId=${encodeURIComponent(leadId)}&policyNumber=${encodeURIComponent(
-        policyNumberForRoute,
-      )}&retentionAgent=${encodeURIComponent(retentionAgent)}&retentionType=${encodeURIComponent(retentionType)}`,
-    );
-  };
-
-  const saveBankingInfoToMondayNotes = async () => {
-    const policyNumberForSave = selectedPolicyView?.policyNumber ?? null;
-    if (!policyNumberForSave) return;
-
-    setBankingSaving(true);
-    setBankingSaveError(null);
-
-    try {
-      const payload = {
-        policy_status: bankingPolicyStatus,
-        account_holder_name: bankingAccountHolderName,
-        bank_name: bankingBankName,
-        routing_number: bankingRoutingNumber,
-        account_number: bankingAccountNumber,
-        account_type: bankingAccountType,
-        draft_date: bankingDraftDate,
-      };
-
-      const { data: dealRow, error: dealErr } = await supabase
-        .from("monday_com_deals")
-        .select("id, notes, last_updated, updated_at")
-        .eq("policy_number", policyNumberForSave)
-        .order("last_updated", { ascending: false, nullsFirst: false })
-        .order("updated_at", { ascending: false, nullsFirst: false })
-        .limit(1)
-        .maybeSingle();
-
-      if (dealErr) throw dealErr;
-      if (!dealRow?.id) throw new Error("No monday_com_deals row found for this policy number.");
-
-      const existingNotes = typeof dealRow.notes === "string" ? dealRow.notes : "";
-      const stamp = new Date().toISOString();
-      const block = `\n\n[Retention Banking Update ${stamp}]\n${JSON.stringify(payload)}`;
-      const nextNotes = `${existingNotes ?? ""}${block}`.trim();
-
-      const { error: updateErr } = await supabase
-        .from("monday_com_deals")
-        .update({ notes: nextNotes })
-        .eq("id", dealRow.id);
-
-      if (updateErr) throw updateErr;
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : "Failed to save banking info.";
-      setBankingSaveError(msg);
-      throw e;
-    } finally {
-      setBankingSaving(false);
-    }
-  };
 
   const updateVerificationItemValue = async (itemId: string, value: string) => {
     setVerificationInputValues((prev) => ({ ...prev, [itemId]: value }));
@@ -1349,9 +1303,11 @@ export function useAssignedLeadDetails() {
   return {
     router,
     idParam,
+    dealId,
     selectedDeal,
     lead,
     personalLead,
+    allPersonalLeads,
     personalLeadLoading,
     mondayDeals,
     mondayLoading,
@@ -1400,7 +1356,7 @@ export function useAssignedLeadDetails() {
     policyCards,
     policyViews,
     selectedPolicyKey,
-    setSelectedPolicyKey,
+    setSelectedPolicyKey: setSelectedPolicyKeyAndSyncUrlWithDealId,
     selectedPolicyView,
     verificationSessionId,
     verificationItems,
@@ -1409,42 +1365,11 @@ export function useAssignedLeadDetails() {
     verificationInputValues,
     toggleVerificationItem,
     updateVerificationItemValue,
-    retentionModalOpen,
-    setRetentionModalOpen,
-    retentionAgent,
-    setRetentionAgent,
-    retentionAgentLocked,
-    retentionType,
-    setRetentionType,
-    retentionAgentOptions: retentionAgentOptions
-      .map((a) => a.display_name)
-      .concat(
-        retentionAgent && !retentionAgentOptions.some((a) => a.display_name === retentionAgent)
-          ? [retentionAgent]
-          : [],
-      ),
-    openRetentionWorkflowModal,
-    startRetentionWorkflow,
-    retentionStep,
-    setRetentionStep,
-    goToCallUpdate,
-    bankingPolicyStatus,
-    setBankingPolicyStatus,
-    bankingAccountHolderName,
-    setBankingAccountHolderName,
-    bankingBankName,
-    setBankingBankName,
-    bankingRoutingNumber,
-    setBankingRoutingNumber,
-    bankingAccountNumber,
-    setBankingAccountNumber,
-    bankingAccountType,
-    setBankingAccountType,
-    bankingDraftDate,
-    setBankingDraftDate,
-    bankingSaving,
-    bankingSaveError,
-    saveBankingInfoToMondayNotes,
+    assignedDealsLoading,
+    previousAssignedDealId,
+    nextAssignedDealId,
+    goToPreviousAssignedLead,
+    goToNextAssignedLead,
     notesItems,
   };
 }
