@@ -8,6 +8,39 @@ export type DealTag =
   | "Cancellation"
   | "Failed Payment";
 
+export type DealLabel = DealCategory | DealTag;
+
+export type DealLabelStyle = {
+  bg: string;
+  border: string;
+  text: string;
+};
+
+export type PolicyStatusStyle = DealLabelStyle;
+
+export const DEAL_LABEL_STYLES: Record<DealLabel, DealLabelStyle> = {
+  "Failed Payment": { bg: "#FEF2F2", border: "#FCA5A5", text: "#B91C1C" },
+  "Pending Lapse": { bg: "#FFFBEB", border: "#FCD34D", text: "#B45309" },
+  "Pending Manual Action": { bg: "#EFF6FF", border: "#93C5FD", text: "#1D4ED8" },
+  Chargeback: { bg: "#FFF1F2", border: "#FDA4AF", text: "#BE123C" },
+
+  "Pending Reason": { bg: "#F5F3FF", border: "#C4B5FD", text: "#6D28D9" },
+  "Incorrect Banking Info": { bg: "#F0FDFA", border: "#5EEAD4", text: "#0F766E" },
+  "Insufficient Funds": { bg: "#FFF7ED", border: "#FDBA74", text: "#C2410C" },
+  "Unauthorized Draft": { bg: "#FDF2F8", border: "#F9A8D4", text: "#BE185D" },
+  Cancellation: { bg: "#F3F4F6", border: "#D1D5DB", text: "#374151" },
+};
+
+const POLICY_STATUS_STYLES: Record<string, PolicyStatusStyle> = {
+  "issued not paid": { bg: "#FEF2F2", border: "#FCA5A5", text: "#B91C1C" },
+  "issued paid": { bg: "#ECFDF5", border: "#6EE7B7", text: "#047857" },
+  "pending lapse": { bg: "#FFFBEB", border: "#FCD34D", text: "#B45309" },
+  "pending manual action": { bg: "#EFF6FF", border: "#93C5FD", text: "#1D4ED8" },
+  "chargeback": { bg: "#FFF1F2", border: "#FDA4AF", text: "#BE123C" },
+  "cancelled": { bg: "#F3F4F6", border: "#D1D5DB", text: "#374151" },
+  "canceled": { bg: "#F3F4F6", border: "#D1D5DB", text: "#374151" },
+};
+
 type MappingEntry = {
   category: DealCategory;
   tag: DealTag | null;
@@ -23,6 +56,7 @@ const STAGE_TO_MAPPING: Record<string, MappingEntry> = {
 
   "chargeback cancellation": { category: "Chargeback", tag: "Cancellation" },
   "chargeback payment failure": { category: "Chargeback", tag: "Failed Payment" },
+  "chargeback failed payment": { category: "Chargeback", tag: "Failed Payment" },
 
   "pending lapse pending reason": { category: "Pending Lapse", tag: "Pending Reason" },
   "pending lapse incorrect banking info": { category: "Pending Lapse", tag: "Incorrect Banking Info" },
@@ -41,7 +75,7 @@ export const CATEGORY_TO_GHL_STAGES: Record<DealCategory, string[]> = {
     "FDPF Unauthorized Draft",
   ],
   "Pending Manual Action": ["Pending Manual Action"],
-  Chargeback: ["Chargeback Cancellation", "Chargeback Payment Failure"],
+  Chargeback: ["Chargeback Cancellation", "Chargeback Payment Failure", "Chargeback Failed Payment"],
   "Pending Lapse": [
     "Pending Lapse",
     "Pending Lapse Pending Reason",
@@ -56,4 +90,22 @@ export function getDealCategoryAndTagFromGhlStage(ghlStage: string | null | unde
   const key = ghlStage.trim().toLowerCase();
   if (!key) return null;
   return STAGE_TO_MAPPING[key] ?? null;
+}
+
+export function getDealTagLabelFromGhlStage(ghlStage: string | null | undefined): DealLabel | null {
+  const mapping = getDealCategoryAndTagFromGhlStage(ghlStage);
+  if (!mapping) return null;
+  return mapping.tag ?? mapping.category;
+}
+
+export function getDealLabelStyle(label: DealLabel | null | undefined): DealLabelStyle | null {
+  if (!label) return null;
+  return DEAL_LABEL_STYLES[label] ?? null;
+}
+
+export function getPolicyStatusStyle(status: string | null | undefined): PolicyStatusStyle | null {
+  if (typeof status !== "string") return null;
+  const key = status.trim().toLowerCase();
+  if (!key) return null;
+  return POLICY_STATUS_STYLES[key] ?? null;
 }
