@@ -11,10 +11,13 @@ import { DashboardProvider } from "@/components/dashboard-context";
 import { AccessGate, AccessProvider } from "@/components/access-context";
 import { CommandPalette } from "@/components/command-palette";
 import { NotificationsSlideover } from "@/components/notifications-slideover";
-import { AircallWidget } from "@/components/aircall/aircall-widget";
+import { CloudTalkWidget } from "@/components/cloudtalk/cloudtalk-widget";
+import { CloudTalkDialerWidget } from "@/components/cloudtalk/cloudtalk-dialer-widget";
+import { CloudTalkWebhookListener } from "@/components/cloudtalk/cloudtalk-webhook-listener";
 import { supabase } from "@/lib/supabase";
 import { ToastContainer } from "react-toastify";
 import { useTheme } from "next-themes";
+import { ErrorBoundary } from "@/components/error-boundary";
 
 const publicSans = Public_Sans({
   subsets: ["latin"],
@@ -84,27 +87,39 @@ export default function App({ Component, pageProps }: AppProps) {
   }
 
   return (
-    <ThemeProvider attribute="class" defaultTheme="light" enableSystem={false}>
-      <main className={publicSans.variable}>
-        <AccessProvider>
-          <DashboardProvider>
-            {isAuthPage ? (
-              <Component {...pageProps} />
-            ) : (
-              <AccessGate pathname={router.asPath.split("?")[0] ?? router.pathname}>
-                <DashboardShell>
-                  <Component {...pageProps} />
-                </DashboardShell>
-              </AccessGate>
-            )}
-            {isAuthPage ? null : <AircallWidget />}
-            <CommandPalette />
-            <NotificationsSlideover />
-            <Toaster />
-            <ThemedToastContainer />
-          </DashboardProvider>
-        </AccessProvider>
-      </main>
-    </ThemeProvider>
+    <ErrorBoundary
+      onError={(error, errorInfo) => {
+        // Log to error tracking service in production
+        if (process.env.NODE_ENV === "production") {
+          console.error("[ErrorBoundary] Production error:", error, errorInfo);
+          // TODO: Send to error tracking service (e.g., Sentry, LogRocket)
+        }
+      }}
+    >
+      <ThemeProvider attribute="class" defaultTheme="light" enableSystem={false}>
+        <main className={publicSans.variable}>
+          <AccessProvider>
+            <DashboardProvider>
+              {isAuthPage ? (
+                <Component {...pageProps} />
+              ) : (
+                <AccessGate pathname={router.asPath.split("?")[0] ?? router.pathname}>
+                  <DashboardShell>
+                    <Component {...pageProps} />
+                  </DashboardShell>
+                </AccessGate>
+              )}
+              {isAuthPage ? null : <CloudTalkWidget />}
+              {isAuthPage ? null : <CloudTalkDialerWidget />}
+              {isAuthPage ? null : <CloudTalkWebhookListener />}
+              <CommandPalette />
+              <NotificationsSlideover />
+              <Toaster />
+              <ThemedToastContainer />
+            </DashboardProvider>
+          </AccessProvider>
+        </main>
+      </ThemeProvider>
+    </ErrorBoundary>
   );
 }
